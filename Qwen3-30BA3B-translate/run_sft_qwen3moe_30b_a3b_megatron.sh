@@ -4,7 +4,7 @@ set -xeuo pipefail
 ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.sft_trainer"}
 TRAIN_FILES=${TRAIN_FILES:-/mnt/data/liuchonghan/translate_parquet/train_data.parquet}
 backend=${BACKEND:-megatron}
-project_name=verl_sft_translate_0109_aux
+project_name=verl_sft_translate_0109
 RESUME_MODE=disable
 MODEL_ID=${MODEL_ID:-/mnt/data/liuchonghan/Qwen3-30B-A3B-Instruct-2507}
 
@@ -38,22 +38,19 @@ FSDP_ENGINE_CONFIG="
 MEGATRON_ENGINE_CONFIG="
     engine=${backend} \
     optim=${backend} \
-    optim.lr=5e-6 \
+    optim.lr=6e-6 \
     optim.lr_warmup_steps_ratio=0.05 \
     optim.weight_decay=0.1 \
     optim.betas="[0.9,0.95]" \
     optim.clip_grad=1.0 \
     optim.lr_warmup_init=0 \
     optim.lr_decay_style=cosine \
-    optim.min_lr=5e-7 \
+    optim.min_lr=6e-7 \
     engine.tensor_model_parallel_size=${TP_SIZE} \
     engine.pipeline_model_parallel_size=${PP_SIZE} \
     engine.expert_model_parallel_size=${EP_SIZE} \
     engine.context_parallel_size=${CP_SIZE} \
-    engine.use_mbridge=True \
-    +engine.override_transformer_config.moe_aux_loss_coeff=0.01 \
-    +engine.override_transformer_config.moe_z_loss_coeff=0.001 \
-    +engine.override_transformer_config.moe_router_load_balancing_type=aux_loss"
+    engine.use_mbridge=True"
 
 if [ "$backend" = "fsdp" ]; then
     ENGINE_CONFIG="$FSDP_ENGINE_CONFIG"
