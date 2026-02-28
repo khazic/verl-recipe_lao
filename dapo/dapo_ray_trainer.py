@@ -36,7 +36,8 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
-from verl.trainer.ppo.reward import compute_reward
+from verl.trainer.ppo.reward import extract_reward
+from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
@@ -52,12 +53,20 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # recompute old_log_probs
         with marked_timer("old_log_prob", timing_raw, "blue"):
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
             entropys = old_log_prob.batch["entropys"]
             response_masks = batch.batch["response_mask"]
-            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+            actor_config = self.config.actor_rollout_ref.actor
+            entropy_agg = agg_loss(
+                loss_mat=entropys,
+                loss_mask=response_masks,
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+            )
+            old_log_prob_metrics = {
+                "actor/entropy": entropy_agg.detach().item(),
+                "perf/mfu/actor_infer": old_log_prob_mfu,
+            }
             metrics.update(old_log_prob_metrics)
             old_log_prob.batch.pop("entropys")
             batch = batch.union(old_log_prob)
@@ -65,10 +74,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         if self.use_reference_policy:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, "olive"):
-                if not self.ref_in_actor:
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                else:
-                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                ref_log_prob = self._compute_ref_log_prob(batch)
                 batch = batch.union(ref_log_prob)
 
         return batch
@@ -93,13 +99,15 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self.gen_steps = 0
+        self.max_steps_duration = 0
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -108,7 +116,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
@@ -131,7 +139,9 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
-        for epoch in range(self.config.trainer.total_epochs):
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -145,6 +155,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 num_gen_batches += 1
                 gen_batch = self._get_gen_batch(new_batch)
                 gen_batch_output = gen_batch.repeat(
@@ -170,9 +181,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             # compute reward model score on new_batch
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                                rm_scores = self.rm_wg.compute_rm_score(new_batch)
+                                rm_scores = self._compute_reward_colocate(new_batch)
                                 new_batch = new_batch.union(rm_scores)
-                            reward_baseline_tensor, _ = compute_reward(new_batch, self.reward_fn)
+                            reward_baseline_tensor, _ = extract_reward(new_batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
@@ -202,11 +213,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # the results from reward model and rule-based results.
                         if self.use_rm and "rm_scores" not in new_batch.batch.keys():
                             # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(new_batch)
-                            new_batch = new_batch.union(reward_tensor)
+                            batch_reward = self._compute_reward_colocate(new_batch)
+                            new_batch = new_batch.union(batch_reward)
 
                         # we combine with rule-based rm
-                        reward_tensor, reward_extra_infos_dict = compute_reward(new_batch, self.reward_fn)
+                        reward_tensor, reward_extra_infos_dict = extract_reward(new_batch)
 
                         new_batch.batch["token_level_scores"] = reward_tensor
 
@@ -287,6 +298,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
 
+                    self.checkpoint_manager.sleep_replicas()
+
                     # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -305,7 +318,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, "cyan"):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self._compute_values(batch)
                             batch = batch.union(values)
 
                     # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
@@ -327,12 +340,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
                         )
 
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -340,7 +354,25 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self._update_actor(batch)
+
+                        # Check if ESI/training plan is close to expiration
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step
+                            or self.global_steps % self.config.trainer.save_freq == 0
+                            or esi_close_to_expiration
+                        ):
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, "green"):
+                                self._save_checkpoint()
+
+                        with marked_timer("update_weights", timing_raw, "red"):
+                            self.checkpoint_manager.update_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -350,22 +382,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, "green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with marked_timer("save_checkpoint", timing_raw, "green"):
-                        self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
@@ -380,6 +404,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
+
+                steps_duration = timing_raw.get("step", 0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
